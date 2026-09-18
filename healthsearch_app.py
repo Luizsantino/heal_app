@@ -1,8 +1,11 @@
 import re
 import unicodedata
+import numpy as np
 import pandas as pd
 import streamlit as st
 from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Configuração da página streamlit
 st.set_page_config(
@@ -97,6 +100,31 @@ def executar_busca_bm25(query: str, corpus_tokens: list[list[str]], k1: float, b
     scores = bm25.get_scores(tokens_consulta)
     return [float(s) for s in scores]
 
+# Fase 3: Motor Semântico com Embeddings
+@st.cache_resource(show_spinner="Carregando modelo de embeddings semânticos denso...")
+def carregar_modelo_semantico():
+    #modelo multilingue de alta precisão semântica para o português
+    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+modelo_semantico = carregar_modelo_semantico()
+
+@st.cache_data
+def gerar_embeddings_corpus(textos: list[str]) -> np.ndarray:
+    """ Gera e faz cache dos embeddings densos do corpus."""
+    return modelo_semantico.encode(textos, normalize_embeddings=True)
+
+embeddings_corpus = gerar_embeddings_corpus(df_corpus["texto_completo"].tolist())
+
+def executar_busca_semantica(query: str, embeddings_docs: np.ndarray) -> list[float]:
+    """Calcula a similaridade de cosseno entre a consulta e os documentos."""
+    if not query.strip():
+        return [0.0] * len(embeddings_docs)
+    query_embedding = modelo_semantico.encode([query], normalize_embeddings=True)
+    # Cosine similarity entre o vetor de query (1 x D) e os docs (N x D)
+    similaridades = cosine_similarity(query_embedding, embeddings_docs)[0]
+    return [float(s) for s in similaridades]
+
+
+
 # Barra Lateral (sidebar) Calibração de parâmetros BM25
 with st.sidebar:
     st.header("⚙️ Calibração de Parâmetros")
@@ -171,30 +199,38 @@ query = st.text_input(
 
 # Execução do Motor BM25 e Demonstração preliminar
 if query.strip():
-    tokens_q = preprocess_lexical(query)
+    # 1. Executa BM25
     scores_bm25 = executar_busca_bm25(query, df_corpus["tokens"].tolist(), k1=k1_param, b=b_param)
+    
+    # 2. Executa Semântico
+    scores_semantico = executar_busca_semantica(query, embeddings_corpus)
+    
+    # Monta DataFrames de Ranking
+    df_resultados = df_corpus.copy()
+    df_resultados["Score_BM25"] = scores_bm25
+    df_resultados["Rank_BM25"] = df_resultados["Score_BM25"].rank(ascending=False, method="min").astype(int)
+    
+    df_resultados["Score_Semantico"] = scores_semantico
+    df_resultados["Rank_Semantico"] = df_resultados["Score_Semantico"].rank(ascending=False, method="min").astype(int)
 
-    df_bm25 = df_corpus.copy()
-    df_bm25["Score_BM25"] = scores_bm25
-    df_bm25["Rank_BM25"] = df_bm25["Score_BM25"].rank(ascending=False, method="min").astype(int)
-    df_bm25 = df_bm25.sort_values(by=["Score_BM25", "id"], ascending=[False, True]).reset_index(drop=True)
+    st.markdown("---")
+    st.subheader("⚔️ Confronto: Léxico (BM25) vs. Semântico (Embeddings)")
 
-    st.markdown("### 📊 Diagnóstico Léxico (BM25)")
-    st.caption(f"Tokens processados da consulta: `{tokens_q}` | Parâmetros ativos: **k₁ = {k1_param}**, **b = {b_param}**")
+    col_lex, col_sem = st.columns(2)
 
-    col_tabela, col_destaque = st.columns([2, 1])
-
-    with col_tabela:
-        st.dataframe(
-            df_bm25[["Rank_BM25", "id", "titulo", "Score_BM25"]],
-            width="stretch",
-            hide_index=True
-        )
-    with col_destaque:
-        top1 = df_bm25.iloc[0]
-        if top1["Score_BM25"] > 0:
-            st.success(f"🏆 **Top 1 Léxico:** {top1['id']} — {top1['titulo']}")
-            st.write(f"*{top1['conteudo']}*")
-            st.metric("Score BM25", f"{top1['Score_BM25']:.4f}")
+    with col_lex:
+        st.markdown("#### 📖 Motor Léxico (BM25)")
+        df_lex_view = df_resultados.sort_values(by="Rank_BM25")[["Rank_BM25", "id", "titulo", "Score_BM25"]]
+        st.dataframe(df_lex_view, use_container_width=True, hide_index=True)
+        top_lex = df_lex_view.iloc[0]
+        if top_lex["Score_BM25"] > 0:
+            st.success(f"**Top 1:** {top_lex['id']} ({top_lex['titulo']}) — Score: `{top_lex['Score_BM25']:.3f}`")
         else:
-            st.warning("⚠️ Nenhum termo da consulta coincidiu exatamente com o corpus (Score = 0). Isso evidencia a falha de sistemas puramente léxicos para vocabulário não exato!")
+            st.warning("⚠️ BM25 falhou em recuperar correspondências exatas.")
+
+    with col_sem:
+        st.markdown("#### 🧠 Motor Semântico (Embeddings)")
+        df_sem_view = df_resultados.sort_values(by="Rank_Semantico")[["Rank_Semantico", "id", "titulo", "Score_Semantico"]]
+        st.dataframe(df_sem_view, use_container_width=True, hide_index=True)
+        top_sem = df_sem_view.iloc[0]
+        st.info(f"**Top 1:** {top_sem['id']} ({top_sem['titulo']}) — Cosseno: `{top_sem['Score_Semantico']:.4f}`")
