@@ -123,7 +123,15 @@ def executar_busca_semantica(query: str, embeddings_docs: np.ndarray) -> list[fl
     similaridades = cosine_similarity(query_embedding, embeddings_docs)[0]
     return [float(s) for s in similaridades]
 
+# Fase 4: Fusão RRF (Reciproval Rank Fusion)
 
+def calcular_rrf(rank_bm25: pd.Series, rank_semantico: pd.Series, alpha: float, k_rrf: int = 60) -> pd.Series:
+    """
+    Score_RRF(D) = alpha * [1 / (k_rrf + Rank_BM25)] + (1 - alpha) * [1 / (k_rrf + Rank_Semantico)]
+    """
+    termo_bm25 = alpha * (1.0 / (k_rrf + rank_bm25))
+    termo_semantico = (1.0 - alpha) * (1.0 / (k_rrf + rank_semantico))
+    return termo_bm25 + termo_semantico
 
 # Barra Lateral (sidebar) Calibração de parâmetros BM25
 with st.sidebar:
@@ -149,7 +157,20 @@ with st.sidebar:
         help="Controla a penalidade aplicada a documentos longos. 1.0 penaliza integralmente o tamanho; 0.0 ignora o tamanho do texto."
     )
 
+    st.subheader("2. Fusão Híbrida RRF")
+    alpha_param = st.slider(
+        "Peso α (Balanceador)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.50,
+        step=0.05,
+        help="α = 1.0 (Apenas BM25) | α = 0.0 (Apenas Semântico) | α = 0.50 (Equilibrado)"
+    )
+    k_rrf_param = 60 # Valor fixo de k para RRF, conforme literatura
+    st.caption(f"Constante de suavização fixa: **k_rrf = {k_rrf_param}**")
+    
     st.divider()
+    st.markdown("### 🎯 Guia Rápido de Testes")
     st.caption("💡 *Dica de teste:* Pesquise por termos exatos como `CÓD-ECG-12D` para avaliar a força do BM25.")
 
 # Cabeçalho & Área de Consulta
@@ -197,7 +218,7 @@ query = st.text_input(
     placeholder="Ex: CÓD-ECG-12D, parada cardíaca, trombolíticos..."
 )
 
-# Execução do Motor BM25 e Demonstração preliminar
+# Processamento dos Motores & Fusão
 if query.strip():
     # 1. Executa BM25
     scores_bm25 = executar_busca_bm25(query, df_corpus["tokens"].tolist(), k1=k1_param, b=b_param)
@@ -205,7 +226,7 @@ if query.strip():
     # 2. Executa Semântico
     scores_semantico = executar_busca_semantica(query, embeddings_corpus)
     
-    # Monta DataFrames de Ranking
+    # 3. Consolidação de Ranks
     df_resultados = df_corpus.copy()
     df_resultados["Score_BM25"] = scores_bm25
     df_resultados["Rank_BM25"] = df_resultados["Score_BM25"].rank(ascending=False, method="min").astype(int)
@@ -213,24 +234,89 @@ if query.strip():
     df_resultados["Score_Semantico"] = scores_semantico
     df_resultados["Rank_Semantico"] = df_resultados["Score_Semantico"].rank(ascending=False, method="min").astype(int)
 
+    # 4. Cálculo RRF
+    # 4. Cálculo RRF
+    df_resultados["Score_RRF"] = calcular_rrf(df_resultados["Rank_BM25"], df_resultados["Rank_Semantico"], alpha=alpha_param, k_rrf=k_rrf_param)
+    df_resultados["Rank_RRF"] = df_resultados["Score_RRF"].rank(ascending=False, method="min").astype(int)
+
+
+
     st.markdown("---")
-    st.subheader("⚔️ Confronto: Léxico (BM25) vs. Semântico (Embeddings)")
+    # ==========================================================================
+    # ABAS DA INTERFACE (CRITÉRIO OBRIGATÓRIO DE AVALIAÇÃO)
+    # ==========================================================================
+    tab_hibrido, tab_lexico, tab_semantico, tab_matriz = st.tabs([
+        "🧬 1. Híbrido RRF (Fusão)",
+        "📖 2. Motor Léxico (BM25)",
+        "🧠 3. Motor Semântico (Embeddings)",
+        "📊 4. Matriz Comparativa & Diagnóstico"
+    ])
 
-    col_lex, col_sem = st.columns(2)
+    # --------------------------------------------------------------------------
+    # ABA 1: HÍBRIDO RRF
+    # --------------------------------------------------------------------------
+    with tab_hibrido:
+        st.markdown(f"### 🏆 Resultados Unificados (RRF com α = {alpha_param:.2f})")
+        st.caption(f"Fórmula: $\\text{{Score}}_{{RRF}}(D) = {alpha_param:.2f} \\cdot \\frac{{1}}{{60 + \\text{{Rank}}_{{BM25}}}} + {(1-alpha_param):.2f} \\cdot \\frac{{1}}{{60 + \\text{{Rank}}_{{Semantico}}}}$")
+        
+        df_hibrido_ordenado = df_resultados.sort_values(by=["Rank_RRF", "Score_RRF"], ascending=[True, False]).reset_index(drop=True)
+        
+        for idx, row in df_hibrido_ordenado.iterrows():
+            with st.container():
+                col_rank, col_conteudo, col_metricas = st.columns([1, 4, 2])
+                with col_rank:
+                    st.metric("Posição RRF", f"#{row['Rank_RRF']}")
+                with col_conteudo:
+                    st.markdown(f"#### {row['id']} — {row['titulo']}")
+                    st.write(row['conteudo'])
+                with col_metricas:
+                    st.caption(f"**Score RRF:** `{row['Score_RRF']:.6f}`")
+                    st.caption(f"**Posição BM25:** #{row['Rank_BM25']} (Score: {row['Score_BM25']:.3f})")
+                    st.caption(f"**Posição Semântica:** #{row['Rank_Semantico']} (Cosseno: {row['Score_Semantico']:.4f})")
+                st.divider()
 
-    with col_lex:
-        st.markdown("#### 📖 Motor Léxico (BM25)")
-        df_lex_view = df_resultados.sort_values(by="Rank_BM25")[["Rank_BM25", "id", "titulo", "Score_BM25"]]
+    # --------------------------------------------------------------------------
+    # ABA 2: LÉXICO BM25
+    # --------------------------------------------------------------------------
+    with tab_lexico:
+        st.markdown("### 📖 Ranking Puro do Okapi BM25")
+        st.caption(f"Tokens processados da consulta: `{preprocess_lexical(query)}`")
+        df_lex_view = df_resultados.sort_values(by=["Rank_BM25", "id"])[["Rank_BM25", "id", "titulo", "Score_BM25", "conteudo"]]
         st.dataframe(df_lex_view, use_container_width=True, hide_index=True)
-        top_lex = df_lex_view.iloc[0]
-        if top_lex["Score_BM25"] > 0:
-            st.success(f"**Top 1:** {top_lex['id']} ({top_lex['titulo']}) — Score: `{top_lex['Score_BM25']:.3f}`")
-        else:
-            st.warning("⚠️ BM25 falhou em recuperar correspondências exatas.")
 
-    with col_sem:
-        st.markdown("#### 🧠 Motor Semântico (Embeddings)")
-        df_sem_view = df_resultados.sort_values(by="Rank_Semantico")[["Rank_Semantico", "id", "titulo", "Score_Semantico"]]
+    # --------------------------------------------------------------------------
+    # ABA 3: SEMÂNTICO VETORIAL
+    # --------------------------------------------------------------------------
+    with tab_semantico:
+        st.markdown("### 🧠 Ranking Puro da Busca Semântica Vetorial")
+        st.caption("Similaridade de Cosseno entre a consulta e os embeddings normalizados do corpus.")
+        df_sem_view = df_resultados.sort_values(by=["Rank_Semantico", "id"])[["Rank_Semantico", "id", "titulo", "Score_Semantico", "conteudo"]]
         st.dataframe(df_sem_view, use_container_width=True, hide_index=True)
-        top_sem = df_sem_view.iloc[0]
-        st.info(f"**Top 1:** {top_sem['id']} ({top_sem['titulo']}) — Cosseno: `{top_sem['Score_Semantico']:.4f}`")
+
+    # --------------------------------------------------------------------------
+    # ABA 4: MATRIZ COMPARATIVA E DIAGNÓSTICO
+    # --------------------------------------------------------------------------
+    with tab_matriz:
+        st.markdown("### 📊 Matriz Comparativa de Desempenho")
+        st.caption("Comparação direta de posições obtidas em cada modalidade de busca.")
+        
+        tabela_comparativa = df_resultados[[
+            "id", "titulo", "Rank_BM25", "Rank_Semantico", "Rank_RRF", "Score_RRF"
+        ]].sort_values(by="Rank_RRF")
+        
+        st.dataframe(
+            tabela_comparativa,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Rank_BM25": st.column_config.NumberColumn("Rank BM25", format="#%d"),
+                "Rank_Semantico": st.column_config.NumberColumn("Rank Semântico", format="#%d"),
+                "Rank_RRF": st.column_config.NumberColumn("Rank RRF (Final)", format="#%d"),
+                "Score_RRF": st.column_config.NumberColumn("Score RRF", format="%.6f"),
+            }
+        )
+        
+        st.markdown("#### 📈 Variação e Deslocamento de Ranks")
+        df_chart = df_resultados[["id", "Rank_BM25", "Rank_Semantico", "Rank_RRF"]].set_index("id")
+        st.bar_chart(df_chart)
+        st.caption("*Nota: No gráfico de barras, menores valores indicam posições mais próximas do topo (#1).*")
