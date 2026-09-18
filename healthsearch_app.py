@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from sklearn.metrics.pairwise import cosine_similarity
 
 # Configuração da página streamlit
@@ -133,6 +133,24 @@ def calcular_rrf(rank_bm25: pd.Series, rank_semantico: pd.Series, alpha: float, 
     termo_semantico = (1.0 - alpha) * (1.0 / (k_rrf + rank_semantico))
     return termo_bm25 + termo_semantico
 
+# Cross-encoder RE_RANKING
+@st.cache_resource(show_spinner="Carregando modelo Cross-Encoder Re-Ranker...")
+def carregar_modelo_cross_encoder():
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+def executar_reranking_cross_encoder(query: str, df_top3: pd.DataFrame) -> pd.DataFrame:
+    """ Aplca atenção cruzada total entre a query e os Top-3 do RRF."""
+    ce_model = carregar_modelo_cross_encoder()
+    pares = [(query, texto) for texto in df_top3["texto_completo"].tolist()]
+    scores_ce = ce_model.predict(pares)
+
+    df_reranked = df_top3.copy()
+    df_reranked["Score_CrossEncoder"] = [float(s) for s in scores_ce]
+    # Reoderna pela nota do Cross-Encoder
+    df_reranked = df_reranked.sort_values(by="Score_CrossEncoder", ascending=False).reset_index(drop=True)
+    df_reranked["Rank_Final_CE"] = [1, 2, 3]
+    return df_reranked
+
 # Barra Lateral (sidebar) Calibração de parâmetros BM25
 with st.sidebar:
     st.header("⚙️ Calibração de Parâmetros")
@@ -170,6 +188,12 @@ with st.sidebar:
     st.caption(f"Constante de suavização fixa: **k_rrf = {k_rrf_param}**")
     
     st.divider()
+    st.subheader("3. Cross-Encoder Re-Ranking (Opcional)")
+    ativar_cross_encoder = st.checkbox(
+        "Ativar Cross-Encoder Re-Ranking (Top-3)",
+        value=False,
+        help="Se ativado, os 3 melhores resultados do RRF serão reordenados usando atenção cruzada total entre a consulta e os documentos."
+    )
     st.markdown("### 🎯 Guia Rápido de Testes")
     st.caption("💡 *Dica de teste:* Pesquise por termos exatos como `CÓD-ECG-12D` para avaliar a força do BM25.")
 
@@ -249,7 +273,8 @@ if query.strip():
         "🧬 1. Híbrido RRF (Fusão)",
         "📖 2. Motor Léxico (BM25)",
         "🧠 3. Motor Semântico (Embeddings)",
-        "📊 4. Matriz Comparativa & Diagnóstico"
+        "📊 4. Matriz Comparativa & Re-Ranking"
+        
     ])
 
     # --------------------------------------------------------------------------
@@ -260,7 +285,13 @@ if query.strip():
         st.caption(f"Fórmula: $\\text{{Score}}_{{RRF}}(D) = {alpha_param:.2f} \\cdot \\frac{{1}}{{60 + \\text{{Rank}}_{{BM25}}}} + {(1-alpha_param):.2f} \\cdot \\frac{{1}}{{60 + \\text{{Rank}}_{{Semantico}}}}$")
         
         df_hibrido_ordenado = df_resultados.sort_values(by=["Rank_RRF", "Score_RRF"], ascending=[True, False]).reset_index(drop=True)
-        
+        # Bloco do Bônus: Cross-Encoder aplicado aos Top-3
+        if ativar_cross_encoder:
+            st.success("⭐ **Camada Bônus Ativa: Cross-Encoder Re-Ranking aplicada aos Top-3!**")
+            df_top3 = df_resultados.sort_values(by=["Rank_RRF"], ascending=True).head(3).copy()
+            df_top3_reranked = executar_reranking_cross_encoder(query, df_top3)
+
+
         for idx, row in df_hibrido_ordenado.iterrows():
             with st.container():
                 col_rank, col_conteudo, col_metricas = st.columns([1, 4, 2])
@@ -294,29 +325,25 @@ if query.strip():
         st.dataframe(df_sem_view, use_container_width=True, hide_index=True)
 
     # --------------------------------------------------------------------------
-    # ABA 4: MATRIZ COMPARATIVA E DIAGNÓSTICO
+    # ABA 4: MATRIZ COMPARATIVA & DIAGNÓSTICO
     # --------------------------------------------------------------------------
     with tab_matriz:
         st.markdown("### 📊 Matriz Comparativa de Desempenho")
-        st.caption("Comparação direta de posições obtidas em cada modalidade de busca.")
         
-        tabela_comparativa = df_resultados[[
-            "id", "titulo", "Rank_BM25", "Rank_Semantico", "Rank_RRF", "Score_RRF"
-        ]].sort_values(by="Rank_RRF")
+        colunas_exibir = ["id", "titulo", "Rank_BM25", "Rank_Semantico", "Rank_RRF", "Score_RRF"]
+        tabela_comp = df_resultados[colunas_exibir].copy()
         
-        st.dataframe(
-            tabela_comparativa,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Rank_BM25": st.column_config.NumberColumn("Rank BM25", format="#%d"),
-                "Rank_Semantico": st.column_config.NumberColumn("Rank Semântico", format="#%d"),
-                "Rank_RRF": st.column_config.NumberColumn("Rank RRF (Final)", format="#%d"),
-                "Score_RRF": st.column_config.NumberColumn("Score RRF", format="%.6f"),
-            }
-        )
+        if ativar_cross_encoder:
+            df_ce_temp = executar_reranking_cross_encoder(query, df_resultados.head(3))
+            map_ce_rank = dict(zip(df_ce_temp["id"], df_ce_temp["Rank_Final_CE"]))
+            map_ce_score = dict(zip(df_ce_temp["id"], df_ce_temp["Score_CrossEncoder"]))
+            
+            tabela_comp["Rank_CrossEncoder"] = tabela_comp["id"].map(map_ce_rank).fillna("-")
+            tabela_comp["Score_CrossEncoder"] = tabela_comp["id"].map(map_ce_score)
         
-        st.markdown("#### 📈 Variação e Deslocamento de Ranks")
+        st.dataframe(tabela_comp, use_container_width=True, hide_index=True)
+        
+        st.markdown("#### 📈 Variação de Ranks dos Candidatos")
         df_chart = df_resultados[["id", "Rank_BM25", "Rank_Semantico", "Rank_RRF"]].set_index("id")
         st.bar_chart(df_chart)
-        st.caption("*Nota: No gráfico de barras, menores valores indicam posições mais próximas do topo (#1).*")
+        st.caption("*Menor barra = melhor posição (#1 é o topo).*")
