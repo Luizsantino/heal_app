@@ -194,8 +194,6 @@ with st.sidebar:
         value=False,
         help="Se ativado, os 3 melhores resultados do RRF serão reordenados usando atenção cruzada total entre a consulta e os documentos."
     )
-    st.markdown("### 🎯 Guia Rápido de Testes")
-    st.caption("💡 *Dica de teste:* Pesquise por termos exatos como `CÓD-ECG-12D` para avaliar a força do BM25.")
 
 # Cabeçalho & Área de Consulta
 st.title("🩺 HealthSearch: Motor de Busca Híbrido")
